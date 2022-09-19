@@ -7,7 +7,6 @@ package ingestor
 import (
 	"context"
 	"fmt"
-
 	"github.com/jackc/pgtype"
 	"github.com/timescale/promscale/pkg/log"
 	"github.com/timescale/promscale/pkg/pgmodel/cache"
@@ -27,6 +26,7 @@ type seriesWriter struct {
 	conn          pgxconn.PgxConn
 	labelArrayOID uint32
 	labelsCache   *cache.InvertedLabelsCache
+	seriesCache   cache.SeriesCache
 }
 
 type SeriesVisitor interface {
@@ -35,8 +35,8 @@ type SeriesVisitor interface {
 
 func labelArrayTranscoder() pgtype.ValueTranscoder { return &pgtype.Int4Array{} }
 
-func NewSeriesWriter(conn pgxconn.PgxConn, labelArrayOID uint32, labelsCache *cache.InvertedLabelsCache) *seriesWriter {
-	return &seriesWriter{conn, labelArrayOID, labelsCache}
+func NewSeriesWriter(conn pgxconn.PgxConn, labelArrayOID uint32, labelsCache *cache.InvertedLabelsCache, seriesCache cache.SeriesCache) *seriesWriter {
+	return &seriesWriter{conn, labelArrayOID, labelsCache, seriesCache}
 }
 
 type perMetricInfo struct {
@@ -54,11 +54,12 @@ type perMetricInfo struct {
 // series are present in the inverted label or series caches. If not present,
 // it creates them in the database (if they have not been created), or fetches
 // their IDs if already created populating the respective caches.
-func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisitor) error {
+func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisitor) (*model.SeriesEpoch, error) {
 	ctx, span := tracer.Default().Start(ctx, "write-series")
 	defer span.End()
 	infos := make(map[string]*perMetricInfo)
 	seriesCount := 0
+	epoch := h.seriesCache.CacheEpoch()
 	err := sv.VisitSeries(func(metricInfo *pgmodel.MetricInfo, series *model.Series) error {
 		if !series.IsSeriesIDSet() {
 			metricName := series.MetricName()
@@ -78,10 +79,10 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(infos) == 0 {
-		return nil
+		return epoch, nil
 	}
 
 	span.SetAttributes(attribute.Int("series_count", seriesCount))
@@ -108,7 +109,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 							continue
 						}
 						if err := info.labelsToFetch.Add(names[i], values[i]); err != nil {
-							return fmt.Errorf("failed to add label to labelList: %w", err)
+							return nil, fmt.Errorf("failed to add label to labelList: %w", err)
 						}
 					}
 				}
@@ -116,7 +117,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 		}
 	}
 	if len(labelMap) == 0 {
-		return nil
+		return epoch, nil
 	}
 
 	//labels have to be created before series are since we need a canonical
@@ -124,15 +125,15 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 	//the labels for multiple series in same txn as we are creating the series,
 	//the ordering of label creation can only be canonical within a series and
 	//not across series.
-	dbEpoch, err := h.fillLabelIDs(ctx, infos, labelMap)
+	err = h.fillLabelIDs(ctx, infos, labelMap)
 	if err != nil {
-		return fmt.Errorf("error setting series ids: %w", err)
+		return nil, fmt.Errorf("error setting series ids: %w", err)
 	}
 
 	//create the label arrays
 	err = h.buildLabelArrays(ctx, infos, labelMap)
 	if err != nil {
-		return fmt.Errorf("error setting series ids: %w", err)
+		return nil, fmt.Errorf("error setting series ids: %w", err)
 	}
 
 	batch := h.conn.NewBatch()
@@ -142,7 +143,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 			continue
 		}
 
-		//transaction per metric to avoid cross-metric locks
+		// transaction per metric to avoid cross-metric locks
 		batch.Queue("BEGIN;")
 		batch.Queue(seriesInsertSQL, info.metricInfo.MetricID, info.metricInfo.TableName, info.labelArraySet)
 		batch.Queue("COMMIT;")
@@ -150,19 +151,19 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 	}
 	br, err := h.conn.SendBatch(context.Background(), batch)
 	if err != nil {
-		return fmt.Errorf("error inserting series: %w", err)
+		return nil, fmt.Errorf("error inserting series: %w", err)
 	}
 	defer br.Close()
 
 	for _, info := range batchInfos {
 		//begin
 		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("error setting series_id begin: %w", err)
+			return nil, fmt.Errorf("error setting series_id begin: %w", err)
 		}
 
 		res, err := br.Query()
 		if err != nil {
-			return fmt.Errorf("error setting series_id: cannot query for series_id: %w", err)
+			return nil, fmt.Errorf("error setting series_id: cannot query for series_id: %w", err)
 		}
 		defer res.Close()
 
@@ -174,13 +175,13 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 			)
 			err := res.Scan(&id, &ordinality)
 			if err != nil {
-				return fmt.Errorf("error setting series_id: cannot scan series_id: %w", err)
+				return nil, fmt.Errorf("error setting series_id: cannot scan series_id: %w", err)
 			}
-			info.series[int(ordinality)-1].SetSeriesID(id, dbEpoch)
+			info.series[int(ordinality)-1].SetSeriesID(id)
 			count++
 		}
 		if err := res.Err(); err != nil {
-			return fmt.Errorf("error setting series_id: reading series id rows: %w", err)
+			return nil, fmt.Errorf("error setting series_id: reading series id rows: %w", err)
 		}
 		if count != len(info.series) {
 			//This should never happen according to the logic. This is purely defensive.
@@ -190,13 +191,13 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 		}
 		//commit
 		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("error setting series_id commit: %w", err)
+			return nil, fmt.Errorf("error setting series_id commit: %w", err)
 		}
 	}
-	return nil
+	return epoch, nil
 }
 
-func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMetricInfo, labelMap map[cache.LabelKey]cache.LabelInfo) (model.SeriesEpoch, error) {
+func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMetricInfo, labelMap map[cache.LabelKey]cache.LabelInfo) error {
 	_, span := tracer.Default().Start(ctx, "fill-label-ids")
 	defer span.End()
 	//we cannot use the label cache here because that maps label ids => name, value.
@@ -204,7 +205,6 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 	//we may want a new cache for that, at a later time.
 
 	batch := h.conn.NewBatch()
-	var dbEpoch model.SeriesEpoch
 
 	// The epoch will never decrease, so we can check it once at the beginning,
 	// at worst we'll store too small an epoch, which is always safe
@@ -226,11 +226,11 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 			}
 			namesSlice, err := names.Slice(i, high)
 			if err != nil {
-				return dbEpoch, fmt.Errorf("error filling labels: slicing names: %w", err)
+				return fmt.Errorf("error filling labels: slicing names: %w", err)
 			}
 			valuesSlice, err := values.Slice(i, high)
 			if err != nil {
-				return dbEpoch, fmt.Errorf("error filling labels: slicing values: %w", err)
+				return fmt.Errorf("error filling labels: slicing values: %w", err)
 			}
 			batch.Queue("BEGIN;")
 			batch.Queue("SELECT * FROM _prom_catalog.get_or_create_label_ids($1, $2, $3, $4)", metricName, info.metricInfo.TableName, namesSlice, valuesSlice)
@@ -250,25 +250,28 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 
 	br, err := h.conn.SendBatch(context.Background(), batch)
 	if err != nil {
-		return dbEpoch, fmt.Errorf("error filling labels: %w", err)
+		return fmt.Errorf("error filling labels: %w", err)
 	}
 	defer br.Close()
 
 	if _, err := br.Exec(); err != nil {
-		return dbEpoch, fmt.Errorf("error filling labels on begin: %w", err)
+		return fmt.Errorf("error filling labels on begin: %w", err)
 	}
-	err = br.QueryRow().Scan(&dbEpoch)
+	var epochTime int64
+	// TODO: perhaps we can remove this query and scan?
+	err = br.QueryRow().Scan(&epochTime)
 	if err != nil {
-		return dbEpoch, fmt.Errorf("error filling labels: %w", err)
+		return fmt.Errorf("error filling labels: %w", err)
 	}
+	//dbEpoch = pgmodel.NewSeriesEpoch(epochTime)
 	if _, err := br.Exec(); err != nil {
-		return dbEpoch, fmt.Errorf("error filling labels on commit: %w", err)
+		return fmt.Errorf("error filling labels on commit: %w", err)
 	}
 
 	var count int
 	for _, info := range infoBatches {
 		if _, err := br.Exec(); err != nil {
-			return dbEpoch, fmt.Errorf("error filling labels on begin label batch: %w", err)
+			return fmt.Errorf("error filling labels on begin label batch: %w", err)
 		}
 
 		err := func() error {
@@ -306,16 +309,16 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 			return nil
 		}()
 		if err != nil {
-			return dbEpoch, err
+			return err
 		}
 		if _, err := br.Exec(); err != nil {
-			return dbEpoch, fmt.Errorf("error filling labels on commit label batch: %w", err)
+			return fmt.Errorf("error filling labels on commit label batch: %w", err)
 		}
 	}
 	if count != items {
-		return dbEpoch, fmt.Errorf("error filling labels: not filling as many items as expected: %v vs %v", count, items)
+		return fmt.Errorf("error filling labels: not filling as many items as expected: %v vs %v", count, items)
 	}
-	return dbEpoch, nil
+	return nil
 }
 
 func (h *seriesWriter) buildLabelArrays(ctx context.Context, infos map[string]*perMetricInfo, labelMap map[cache.LabelKey]cache.LabelInfo) error {

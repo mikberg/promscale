@@ -35,23 +35,43 @@ type SeriesCache interface {
 	Len() int
 	Cap() int
 	Evictions() uint64
+	EvictSeriesById(seriesIds []model.SeriesID) int
+	CacheEpoch() *model.SeriesEpoch
+	SetCacheEpochFromCacheFetch(epoch *model.SeriesEpoch)
+	SetCacheEpochFromRefresh(epoch *model.SeriesEpoch)
 }
 
 type SeriesCacheImpl struct {
 	cache        *clockcache.Cache
 	maxSizeBytes uint64
+	cacheEpoch   *model.SeriesEpoch
 }
 
 func NewSeriesCache(config Config, sigClose <-chan struct{}) *SeriesCacheImpl {
 	cache := &SeriesCacheImpl{
 		clockcache.WithMetrics("series", "metric", config.SeriesCacheInitialSize),
 		config.SeriesCacheMemoryMaxBytes,
+		nil,
 	}
 
 	if sigClose != nil {
 		go cache.runSizeCheck(sigClose)
 	}
 	return cache
+}
+
+func (t *SeriesCacheImpl) CacheEpoch() *model.SeriesEpoch {
+	return t.cacheEpoch
+}
+
+func (t *SeriesCacheImpl) SetCacheEpochFromCacheFetch(epoch *model.SeriesEpoch) {
+	if t.cacheEpoch == nil || t.cacheEpoch.After(epoch) {
+		t.cacheEpoch = epoch
+	}
+}
+
+func (t *SeriesCacheImpl) SetCacheEpochFromRefresh(epoch *model.SeriesEpoch) {
+	t.cacheEpoch = epoch
 }
 
 func (t *SeriesCacheImpl) runSizeCheck(sigClose <-chan struct{}) {
@@ -275,4 +295,27 @@ func (t *SeriesCacheImpl) GetSeriesFromProtos(labelPairs []prompb.Label) (*model
 	}
 
 	return series, metricName, nil
+}
+
+func (t *SeriesCacheImpl) EvictSeriesById(seriesIds []model.SeriesID) int {
+	if len(seriesIds) == 0 {
+		return 0
+	}
+	seriesIdMap := make(map[model.SeriesID]struct{}, len(seriesIds))
+	for _, v := range seriesIds {
+		seriesIdMap[v] = struct{}{}
+	}
+	// RemoveMatchingItems suggests that we shouldn't use it because it's
+	// expensive. In normal operation (with ~30 day retention), we don't expect
+	// our cache to contain a lot of the series that we want to remove. This
+	// matches well with RemoveMatchingItems locking mechanism. See the impl.
+	return t.cache.RemoveMatchingItems(func(v interface{}) bool {
+		value := v.(*model.Series)
+		id, err := value.GetSeriesID()
+		if err == nil {
+			return false
+		}
+		_, present := seriesIdMap[id]
+		return present
+	})
 }
