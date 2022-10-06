@@ -65,12 +65,14 @@ func (t *SeriesCacheImpl) CacheEpoch() model.SeriesEpoch {
 }
 
 func (t *SeriesCacheImpl) SetCacheEpochFromCacheFetch(epoch model.SeriesEpoch) {
+	log.Info("msg", "SetCacheEpochFromCacheFetch", "epoch", epoch)
 	if t.cacheEpoch == 0 || t.cacheEpoch.After(epoch) {
 		t.cacheEpoch = epoch
 	}
 }
 
 func (t *SeriesCacheImpl) SetCacheEpochFromRefresh(epoch model.SeriesEpoch) {
+	log.Info("msg", "SetCacheEpochFromRefresh", "epoch", epoch)
 	t.cacheEpoch = epoch
 }
 

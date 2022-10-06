@@ -263,7 +263,7 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 	if err != nil {
 		return fmt.Errorf("error filling labels: %w", err)
 	}
-	//dbEpoch = pgmodel.NewSeriesEpoch(epochTime)
+	h.seriesCache.SetCacheEpochFromCacheFetch(pgmodel.SeriesEpoch(epochTime))
 	if _, err := br.Exec(); err != nil {
 		return fmt.Errorf("error filling labels on commit: %w", err)
 	}
