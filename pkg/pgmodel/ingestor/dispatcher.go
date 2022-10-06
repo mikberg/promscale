@@ -150,7 +150,7 @@ func (p *pgxDispatcher) refreshSeriesEpoch() {
 	var dbCurrentEpochRaw, dbDeleteEpochRaw int64
 	row := p.conn.QueryRow(context.Background(), getEpochSQL)
 	err := row.Scan(&dbCurrentEpochRaw, &dbDeleteEpochRaw)
-	dbCurrentEpoch, dbDeleteEpoch := model.NewSeriesEpoch(dbCurrentEpochRaw), model.NewSeriesEpoch(dbDeleteEpochRaw)
+	dbCurrentEpoch, dbDeleteEpoch := model.SeriesEpoch(dbCurrentEpochRaw), model.SeriesEpoch(dbDeleteEpochRaw)
 
 	cacheCurrentEpoch := p.scache.CacheEpoch()
 

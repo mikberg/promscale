@@ -36,22 +36,22 @@ type SeriesCache interface {
 	Cap() int
 	Evictions() uint64
 	EvictSeriesById(seriesIds []model.SeriesID) int
-	CacheEpoch() *model.SeriesEpoch
-	SetCacheEpochFromCacheFetch(epoch *model.SeriesEpoch)
-	SetCacheEpochFromRefresh(epoch *model.SeriesEpoch)
+	CacheEpoch() model.SeriesEpoch
+	SetCacheEpochFromCacheFetch(epoch model.SeriesEpoch)
+	SetCacheEpochFromRefresh(epoch model.SeriesEpoch)
 }
 
 type SeriesCacheImpl struct {
 	cache        *clockcache.Cache
 	maxSizeBytes uint64
-	cacheEpoch   *model.SeriesEpoch
+	cacheEpoch   model.SeriesEpoch
 }
 
 func NewSeriesCache(config Config, sigClose <-chan struct{}) *SeriesCacheImpl {
 	cache := &SeriesCacheImpl{
 		clockcache.WithMetrics("series", "metric", config.SeriesCacheInitialSize),
 		config.SeriesCacheMemoryMaxBytes,
-		nil,
+		model.SeriesEpoch(0),
 	}
 
 	if sigClose != nil {
@@ -60,17 +60,17 @@ func NewSeriesCache(config Config, sigClose <-chan struct{}) *SeriesCacheImpl {
 	return cache
 }
 
-func (t *SeriesCacheImpl) CacheEpoch() *model.SeriesEpoch {
+func (t *SeriesCacheImpl) CacheEpoch() model.SeriesEpoch {
 	return t.cacheEpoch
 }
 
-func (t *SeriesCacheImpl) SetCacheEpochFromCacheFetch(epoch *model.SeriesEpoch) {
-	if t.cacheEpoch == nil || t.cacheEpoch.After(epoch) {
+func (t *SeriesCacheImpl) SetCacheEpochFromCacheFetch(epoch model.SeriesEpoch) {
+	if t.cacheEpoch == 0 || t.cacheEpoch.After(epoch) {
 		t.cacheEpoch = epoch
 	}
 }
 
-func (t *SeriesCacheImpl) SetCacheEpochFromRefresh(epoch *model.SeriesEpoch) {
+func (t *SeriesCacheImpl) SetCacheEpochFromRefresh(epoch model.SeriesEpoch) {
 	t.cacheEpoch = epoch
 }
 

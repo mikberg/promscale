@@ -201,7 +201,7 @@ hot_gather:
 	return batch, true
 }
 
-func doInsertOrFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch *pgmodel.SeriesEpoch, reqs ...copyRequest) {
+func doInsertOrFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) {
 	ctx, span := tracer.Default().Start(ctx, "do-insert-or-fallback")
 	defer span.End()
 	err, _ := insertSeries(ctx, conn, false, cacheEpoch, reqs...)
@@ -234,7 +234,7 @@ func isPGUniqueViolation(err error) bool {
 	return false
 }
 
-func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch *pgmodel.SeriesEpoch, reqs ...copyRequest) {
+func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) {
 	ctx, span := tracer.Default().Start(ctx, "insert-batch-error-fallback")
 	defer span.End()
 	for i := range reqs {
@@ -252,7 +252,7 @@ func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEp
 // If we inserted into a compressed chunk, we decompress the chunk and try again.
 // Since a single batch can have both errors, we need to remember the insert method
 // we're using, so that we deduplicate if needed.
-func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, cacheEpoch *pgmodel.SeriesEpoch, req copyRequest, minTime int64) error {
+func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, cacheEpoch pgmodel.SeriesEpoch, req copyRequest, minTime int64) error {
 	ctx, span := tracer.Default().Start(ctx, "try-recovery")
 	defer span.End()
 	// we only recover from postgres errors right now
@@ -272,7 +272,7 @@ func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, cacheEpoc
 	return pgErr
 }
 
-func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ *pgmodel.SeriesEpoch, _ copyRequest, _ int64) error {
+func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ pgmodel.SeriesEpoch, _ copyRequest, _ int64) error {
 	log.WarnRateLimited("msg", "Rejecting samples falling on compressed chunks as decompression is disabled")
 	return nil
 }
@@ -280,7 +280,7 @@ func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ *pgmodel.SeriesEp
 // In the event we filling in old data and the chunk we want to INSERT into has
 // already been compressed, we decompress the chunk and try again. When we do
 // this we delay the recompression to give us time to insert additional data.
-func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch *pgmodel.SeriesEpoch, req copyRequest, minTimeInt int64) error {
+func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, req copyRequest, minTimeInt int64) error {
 	ctx, span := tracer.Default().Start(ctx, "retry-after-decompression")
 	defer span.End()
 	var (
@@ -338,7 +338,7 @@ func debugInsert() {
 var labelsCopier = prometheus.Labels{"type": "metric", "subsystem": "copier"}
 
 // insertSeries performs the insertion of time-series into the DB.
-func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, cacheEpoch *pgmodel.SeriesEpoch, reqs ...copyRequest) (error, int64) {
+func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) (error, int64) {
 	_, span := tracer.Default().Start(ctx, "insert-series")
 	defer span.End()
 	numRowsPerInsert := make([]int, 0, len(reqs))
@@ -471,7 +471,7 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, ca
 	//thus we don't need row locking here. Note by doing this check at the end we can
 	//have some wasted work for the inserts before this fails but this is rare.
 	//avoiding an additional loop or memoization to find the lowest epoch ahead of time seems worth it.
-	row := tx.QueryRow(ctx, "SELECT CASE $1 <= delete_epoch WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", cacheEpoch.Time())
+	row := tx.QueryRow(ctx, "SELECT CASE $1 <= delete_epoch WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", cacheEpoch)
 	var val []byte
 	if err = row.Scan(&val); err != nil {
 		return err, lowestMinTime

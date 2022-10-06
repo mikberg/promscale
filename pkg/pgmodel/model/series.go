@@ -27,26 +27,14 @@ func (s SeriesID) String() string {
 }
 
 // SeriesEpoch represents the series epoch
-type SeriesEpoch struct {
-	time int64
+type SeriesEpoch int64
+
+func (s SeriesEpoch) After(o SeriesEpoch) bool {
+	return s > o
 }
 
-func NewSeriesEpoch(epochTime int64) *SeriesEpoch {
-	return &SeriesEpoch{
-		time: epochTime,
-	}
-}
-
-func (s *SeriesEpoch) After(o *SeriesEpoch) bool {
-	return s.time > o.time
-}
-
-func (s *SeriesEpoch) AfterEq(o *SeriesEpoch) bool {
-	return s.time > o.time
-}
-
-func (s *SeriesEpoch) Time() int64 {
-	return s.time
+func (s SeriesEpoch) AfterEq(o SeriesEpoch) bool {
+	return s > o
 }
 
 // Series stores a Prometheus labels.Labels in its canonical string representation

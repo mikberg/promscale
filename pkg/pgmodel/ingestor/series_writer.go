@@ -54,7 +54,7 @@ type perMetricInfo struct {
 // series are present in the inverted label or series caches. If not present,
 // it creates them in the database (if they have not been created), or fetches
 // their IDs if already created populating the respective caches.
-func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisitor) (*model.SeriesEpoch, error) {
+func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisitor) (model.SeriesEpoch, error) {
 	ctx, span := tracer.Default().Start(ctx, "write-series")
 	defer span.End()
 	infos := make(map[string]*perMetricInfo)
@@ -79,7 +79,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if len(infos) == 0 {
 		return epoch, nil
@@ -109,7 +109,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 							continue
 						}
 						if err := info.labelsToFetch.Add(names[i], values[i]); err != nil {
-							return nil, fmt.Errorf("failed to add label to labelList: %w", err)
+							return 0, fmt.Errorf("failed to add label to labelList: %w", err)
 						}
 					}
 				}
@@ -127,13 +127,13 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 	//not across series.
 	err = h.fillLabelIDs(ctx, infos, labelMap)
 	if err != nil {
-		return nil, fmt.Errorf("error setting series ids: %w", err)
+		return 0, fmt.Errorf("error setting series ids: %w", err)
 	}
 
 	//create the label arrays
 	err = h.buildLabelArrays(ctx, infos, labelMap)
 	if err != nil {
-		return nil, fmt.Errorf("error setting series ids: %w", err)
+		return 0, fmt.Errorf("error setting series ids: %w", err)
 	}
 
 	batch := h.conn.NewBatch()
@@ -151,19 +151,19 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 	}
 	br, err := h.conn.SendBatch(context.Background(), batch)
 	if err != nil {
-		return nil, fmt.Errorf("error inserting series: %w", err)
+		return 0, fmt.Errorf("error inserting series: %w", err)
 	}
 	defer br.Close()
 
 	for _, info := range batchInfos {
 		//begin
 		if _, err := br.Exec(); err != nil {
-			return nil, fmt.Errorf("error setting series_id begin: %w", err)
+			return 0, fmt.Errorf("error setting series_id begin: %w", err)
 		}
 
 		res, err := br.Query()
 		if err != nil {
-			return nil, fmt.Errorf("error setting series_id: cannot query for series_id: %w", err)
+			return 0, fmt.Errorf("error setting series_id: cannot query for series_id: %w", err)
 		}
 		defer res.Close()
 
@@ -175,13 +175,13 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 			)
 			err := res.Scan(&id, &ordinality)
 			if err != nil {
-				return nil, fmt.Errorf("error setting series_id: cannot scan series_id: %w", err)
+				return 0, fmt.Errorf("error setting series_id: cannot scan series_id: %w", err)
 			}
 			info.series[int(ordinality)-1].SetSeriesID(id)
 			count++
 		}
 		if err := res.Err(); err != nil {
-			return nil, fmt.Errorf("error setting series_id: reading series id rows: %w", err)
+			return 0, fmt.Errorf("error setting series_id: reading series id rows: %w", err)
 		}
 		if count != len(info.series) {
 			//This should never happen according to the logic. This is purely defensive.
@@ -191,7 +191,7 @@ func (h *seriesWriter) PopulateOrCreateSeries(ctx context.Context, sv SeriesVisi
 		}
 		//commit
 		if _, err := br.Exec(); err != nil {
-			return nil, fmt.Errorf("error setting series_id commit: %w", err)
+			return 0, fmt.Errorf("error setting series_id commit: %w", err)
 		}
 	}
 	return epoch, nil
