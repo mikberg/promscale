@@ -257,9 +257,9 @@ func (h *seriesWriter) fillLabelIDs(ctx context.Context, infos map[string]*perMe
 	if _, err := br.Exec(); err != nil {
 		return fmt.Errorf("error filling labels on begin: %w", err)
 	}
-	var epochTime int64
+	var epochTime, deleteEpoch int64
 	// TODO: perhaps we can remove this query and scan?
-	err = br.QueryRow().Scan(&epochTime)
+	err = br.QueryRow().Scan(&epochTime, &deleteEpoch)
 	if err != nil {
 		return fmt.Errorf("error filling labels: %w", err)
 	}
