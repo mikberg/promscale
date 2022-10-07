@@ -143,7 +143,7 @@ func persistBatch(ctx context.Context, conn pgxconn.PgxConn, sw *seriesWriter, e
 	ctx, span := tracer.Default().Start(ctx, "persist-batch")
 	defer span.End()
 	batch := copyBatch(insertBatch)
-	cacheEpoch, err := sw.PopulateOrCreateSeries(ctx, batch)
+	err := sw.PopulateOrCreateSeries(ctx, batch)
 
 	if err != nil {
 		return fmt.Errorf("copier: writing series: %w", err)
@@ -153,7 +153,7 @@ func persistBatch(ctx context.Context, conn pgxconn.PgxConn, sw *seriesWriter, e
 		return fmt.Errorf("copier: formatting exemplar label values: %w", err)
 	}
 
-	doInsertOrFallback(ctx, conn, cacheEpoch, insertBatch...)
+	doInsertOrFallback(ctx, conn, insertBatch...)
 	return nil
 }
 
@@ -201,17 +201,17 @@ hot_gather:
 	return batch, true
 }
 
-func doInsertOrFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) {
+func doInsertOrFallback(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest) {
 	ctx, span := tracer.Default().Start(ctx, "do-insert-or-fallback")
 	defer span.End()
-	err, _ := insertSeries(ctx, conn, false, cacheEpoch, reqs...)
+	err, _ := insertSeries(ctx, conn, false, reqs...)
 	if err != nil {
 		if isPGUniqueViolation(err) {
-			err, _ = insertSeries(ctx, conn, true, cacheEpoch, reqs...)
+			err, _ = insertSeries(ctx, conn, true, reqs...)
 		}
 		if err != nil {
 			log.Error("msg", err)
-			insertBatchErrorFallback(ctx, conn, cacheEpoch, reqs...)
+			insertBatchErrorFallback(ctx, conn, reqs...)
 			return
 		}
 	}
@@ -234,13 +234,13 @@ func isPGUniqueViolation(err error) bool {
 	return false
 }
 
-func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) {
+func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, reqs ...copyRequest) {
 	ctx, span := tracer.Default().Start(ctx, "insert-batch-error-fallback")
 	defer span.End()
 	for i := range reqs {
-		err, minTime := insertSeries(ctx, conn, true, cacheEpoch, reqs[i])
+		err, minTime := insertSeries(ctx, conn, true, reqs[i])
 		if err != nil {
-			err = tryRecovery(ctx, conn, err, cacheEpoch, reqs[i], minTime)
+			err = tryRecovery(ctx, conn, err, reqs[i], minTime)
 		}
 
 		reqs[i].data.reportResults(err)
@@ -252,7 +252,7 @@ func insertBatchErrorFallback(ctx context.Context, conn pgxconn.PgxConn, cacheEp
 // If we inserted into a compressed chunk, we decompress the chunk and try again.
 // Since a single batch can have both errors, we need to remember the insert method
 // we're using, so that we deduplicate if needed.
-func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, cacheEpoch pgmodel.SeriesEpoch, req copyRequest, minTime int64) error {
+func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, req copyRequest, minTime int64) error {
 	ctx, span := tracer.Default().Start(ctx, "try-recovery")
 	defer span.End()
 	// we only recover from postgres errors right now
@@ -265,14 +265,14 @@ func tryRecovery(ctx context.Context, conn pgxconn.PgxConn, err error, cacheEpoc
 
 	if pgErr.Code == "0A000" || strings.Contains(pgErr.Message, "compressed") || strings.Contains(pgErr.Message, "insert/update/delete not permitted") {
 		// If the error was that the table is already compressed, decompress and try again.
-		return handleDecompression(ctx, conn, cacheEpoch, req, minTime)
+		return handleDecompression(ctx, conn, req, minTime)
 	}
 
 	log.Warn("msg", fmt.Sprintf("unexpected postgres error while inserting to %s", req.info.TableName), "err", pgErr.Error())
 	return pgErr
 }
 
-func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ pgmodel.SeriesEpoch, _ copyRequest, _ int64) error {
+func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ copyRequest, _ int64) error {
 	log.WarnRateLimited("msg", "Rejecting samples falling on compressed chunks as decompression is disabled")
 	return nil
 }
@@ -280,7 +280,7 @@ func skipDecompression(_ context.Context, _ pgxconn.PgxConn, _ pgmodel.SeriesEpo
 // In the event we filling in old data and the chunk we want to INSERT into has
 // already been compressed, we decompress the chunk and try again. When we do
 // this we delay the recompression to give us time to insert additional data.
-func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, cacheEpoch pgmodel.SeriesEpoch, req copyRequest, minTimeInt int64) error {
+func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, req copyRequest, minTimeInt int64) error {
 	ctx, span := tracer.Default().Start(ctx, "retry-after-decompression")
 	defer span.End()
 	var (
@@ -312,9 +312,9 @@ func retryAfterDecompression(ctx context.Context, conn pgxconn.PgxConn, cacheEpo
 
 	metrics.IngestorDecompressCalls.With(prometheus.Labels{"type": "metric", "kind": "sample"}).Inc()
 	metrics.IngestorDecompressEarliest.With(prometheus.Labels{"type": "metric", "kind": "sample", "table": table}).Set(float64(minTime.UnixNano()) / 1e9)
-	err, _ := insertSeries(ctx, conn, false, cacheEpoch, req) // Attempt an insert again.
+	err, _ := insertSeries(ctx, conn, false, req) // Attempt an insert again.
 	if isPGUniqueViolation(err) {
-		err, _ = insertSeries(ctx, conn, true, cacheEpoch, req) // And again :)
+		err, _ = insertSeries(ctx, conn, true, req) // And again :)
 	}
 	return err
 }
@@ -338,7 +338,7 @@ func debugInsert() {
 var labelsCopier = prometheus.Labels{"type": "metric", "subsystem": "copier"}
 
 // insertSeries performs the insertion of time-series into the DB.
-func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, cacheEpoch pgmodel.SeriesEpoch, reqs ...copyRequest) (error, int64) {
+func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, reqs ...copyRequest) (error, int64) {
 	_, span := tracer.Default().Start(ctx, "insert-series")
 	defer span.End()
 	numRowsPerInsert := make([]int, 0, len(reqs))
@@ -350,6 +350,7 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, ca
 	var exemplarRows [][]interface{}
 	insertStart := time.Now()
 	lowestMinTime := int64(math.MaxInt64)
+	minCacheEpoch := pgmodel.SeriesEpoch(math.MaxInt64)
 	tx, err := conn.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to start transaction for inserting metrics: %v", err), lowestMinTime
@@ -364,6 +365,9 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, ca
 
 	for r := range reqs {
 		req := &reqs[r]
+		if minCacheEpoch.After(req.data.batch.SeriesCacheEpoch()) {
+			minCacheEpoch = req.data.batch.SeriesCacheEpoch()
+		}
 		// Since seriesId order is not guaranteed we need to sort it to avoid row deadlock when duplicates are sent (eg. Prometheus retry)
 		// Samples inside series should be sorted by Prometheus
 		// We sort after PopulateOrCreateSeries call because we now have guarantees that all seriesIDs have been populated
@@ -467,11 +471,12 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, ca
 		}
 	}
 
-	//note the epoch increment takes an access exclusive on the table before incrementing.
-	//thus we don't need row locking here. Note by doing this check at the end we can
-	//have some wasted work for the inserts before this fails but this is rare.
-	//avoiding an additional loop or memoization to find the lowest epoch ahead of time seems worth it.
-	row := tx.QueryRow(ctx, "SELECT CASE $1 <= delete_epoch WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", cacheEpoch)
+	// Note: The epoch increment takes an access exclusive on the table before
+	// incrementing, thus we don't need row locking here. By doing this check
+	// at the end we can have some wasted work for the inserts before this
+	// fails but this is rare. Avoiding an additional loop or memoization to
+	// find the lowest epoch ahead of time seems worth it.
+	row := tx.QueryRow(ctx, "SELECT CASE $1 <= delete_epoch WHEN true THEN _prom_catalog.epoch_abort($1) END FROM _prom_catalog.ids_epoch LIMIT 1", minCacheEpoch)
 	var val []byte
 	if err = row.Scan(&val); err != nil {
 		return err, lowestMinTime

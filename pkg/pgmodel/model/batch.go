@@ -6,6 +6,7 @@ package model
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/timescale/promscale/pkg/log"
@@ -14,21 +15,26 @@ import (
 // Data wraps incoming data with its in-timestamp. It is used to warn if the rate
 // of incoming samples vs outgoing samples is too low, based on time.
 type Data struct {
-	Rows         map[string][]Insertable
-	ReceivedTime time.Time
+	Rows             map[string][]Insertable
+	ReceivedTime     time.Time
+	SeriesCacheEpoch SeriesEpoch
 }
 
 // Batch is an iterator over a collection of Insertables that returns
 // data in the format expected for the data table row.
 type Batch struct {
-	data         []Insertable
-	numSamples   int
-	numExemplars int
+	data             []Insertable
+	seriesCacheEpoch SeriesEpoch
+	numSamples       int
+	numExemplars     int
 }
 
 // NewBatch returns a new batch that can hold samples and exemplars.
 func NewBatch() Batch {
-	si := Batch{data: make([]Insertable, 0)}
+	si := Batch{
+		data:             make([]Insertable, 0),
+		seriesCacheEpoch: SeriesEpoch(math.MaxInt64),
+	}
 	return si
 }
 
@@ -71,6 +77,16 @@ func (t *Batch) Visitor() *batchVisitor {
 
 func (t *Batch) Absorb(other Batch) {
 	t.AppendSlice(other.data)
+}
+
+func (t *Batch) SeriesCacheEpoch() SeriesEpoch {
+	return t.seriesCacheEpoch
+}
+
+func (t *Batch) UpdateSeriesCacheEpoch(epoch SeriesEpoch) {
+	if t.seriesCacheEpoch.After(epoch) {
+		t.seriesCacheEpoch = epoch
+	}
 }
 
 func (t *Batch) Len() int {

@@ -30,15 +30,14 @@ const GrowFactor = float64(2.0)       // multiply cache size by this factor when
 
 // SeriesCache is a cache of model.Series entries.
 type SeriesCache interface {
-	Reset()
+	Reset(epoch model.SeriesEpoch)
 	GetSeriesFromProtos(labelPairs []prompb.Label) (series *model.Series, metricName string, err error)
 	Len() int
 	Cap() int
 	Evictions() uint64
-	EvictSeriesById(seriesIds []model.SeriesID) int
+	EvictSeriesById(seriesIds []model.SeriesID, epoch model.SeriesEpoch) int
 	CacheEpoch() model.SeriesEpoch
-	SetCacheEpochFromCacheFetch(epoch model.SeriesEpoch)
-	SetCacheEpochFromRefresh(epoch model.SeriesEpoch)
+	SetCacheEpoch(epoch model.SeriesEpoch)
 }
 
 type SeriesCacheImpl struct {
@@ -64,15 +63,7 @@ func (t *SeriesCacheImpl) CacheEpoch() model.SeriesEpoch {
 	return t.cacheEpoch
 }
 
-func (t *SeriesCacheImpl) SetCacheEpochFromCacheFetch(epoch model.SeriesEpoch) {
-	log.Info("msg", "SetCacheEpochFromCacheFetch", "epoch", epoch)
-	if t.cacheEpoch == 0 || t.cacheEpoch.After(epoch) {
-		t.cacheEpoch = epoch
-	}
-}
-
-func (t *SeriesCacheImpl) SetCacheEpochFromRefresh(epoch model.SeriesEpoch) {
-	log.Info("msg", "SetCacheEpochFromRefresh", "epoch", epoch)
+func (t *SeriesCacheImpl) SetCacheEpoch(epoch model.SeriesEpoch) {
 	t.cacheEpoch = epoch
 }
 
@@ -136,8 +127,11 @@ func (t *SeriesCacheImpl) Evictions() uint64 {
 }
 
 // Reset should be concurrency-safe
-func (t *SeriesCacheImpl) Reset() {
+func (t *SeriesCacheImpl) Reset(epoch model.SeriesEpoch) {
 	t.cache.Reset()
+	// When we reset the cache, we need to reset the cache epoch as well,
+	// otherwise it may be out of date as soon as data is loaded into it.
+	t.SetCacheEpoch(epoch)
 }
 
 // Get the canonical version of a series if one exists.
@@ -299,7 +293,7 @@ func (t *SeriesCacheImpl) GetSeriesFromProtos(labelPairs []prompb.Label) (*model
 	return series, metricName, nil
 }
 
-func (t *SeriesCacheImpl) EvictSeriesById(seriesIds []model.SeriesID) int {
+func (t *SeriesCacheImpl) EvictSeriesById(seriesIds []model.SeriesID, epoch model.SeriesEpoch) int {
 	if len(seriesIds) == 0 {
 		return 0
 	}
@@ -311,7 +305,7 @@ func (t *SeriesCacheImpl) EvictSeriesById(seriesIds []model.SeriesID) int {
 	// expensive. In normal operation (with ~30 day retention), we don't expect
 	// our cache to contain a lot of the series that we want to remove. This
 	// matches well with RemoveMatchingItems locking mechanism. See the impl.
-	return t.cache.RemoveMatchingItems(func(v interface{}) bool {
+	count := t.cache.RemoveMatchingItems(func(v interface{}) bool {
 		value := v.(*model.Series)
 		id, err := value.GetSeriesID()
 		if err == nil {
@@ -320,4 +314,6 @@ func (t *SeriesCacheImpl) EvictSeriesById(seriesIds []model.SeriesID) int {
 		_, present := seriesIdMap[id]
 		return present
 	})
+	t.SetCacheEpoch(epoch)
+	return count
 }

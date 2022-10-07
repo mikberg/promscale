@@ -60,6 +60,14 @@ func newPgxDispatcher(conn pgxconn.PgxConn, mCache cache.MetricCache, scache cac
 		numCopiers = 1
 	}
 
+	var dbCurrentEpoch int64
+	// Bump the current epoch if it was still set to the initial value, and
+	// initialize the cache's epoch. Initializing the cache's epoch is crucial
+	// to ensure that ingestion will abort if a stale cache entry is present.
+	row := conn.QueryRow(context.Background(), "SELECT _prom_catalog.initialize_current_epoch(now())")
+	err := row.Scan(&dbCurrentEpoch)
+	scache.SetCacheEpoch(model.SeriesEpoch(dbCurrentEpoch))
+
 	// the copier read request channel retains the queue order between metrics
 	maxMetrics := 10000
 	copierReadRequestCh := make(chan readRequest, maxMetrics)
@@ -98,7 +106,7 @@ func newPgxDispatcher(conn pgxconn.PgxConn, mCache cache.MetricCache, scache cac
 		asyncAcks:              cfg.MetricsAsyncAcks,
 		copierReadRequestCh:    copierReadRequestCh,
 		// set to run at half our deletion interval
-		// TODO: actually run this based on the deletion interval set in the DB.
+		// TODO (james): actually run this based on the deletion interval set in the DB.
 		seriesEpochRefresh: time.NewTicker(30 * time.Minute),
 		doneChannel:        make(chan struct{}),
 		closed:             uber_atomic.NewBool(false),
@@ -145,49 +153,56 @@ func (p *pgxDispatcher) runSeriesEpochSync() {
 	}
 }
 
+func (p *pgxDispatcher) getDatabaseEpochs() (model.SeriesEpoch, model.SeriesEpoch, error) {
+	var dbCurrentEpoch, dbDeleteEpoch int64
+	row := p.conn.QueryRow(context.Background(), getEpochSQL)
+	err := row.Scan(&dbCurrentEpoch, &dbDeleteEpoch)
+	if err != nil {
+		return 0, 0, nil
+	}
+	return model.SeriesEpoch(dbCurrentEpoch), model.SeriesEpoch(dbDeleteEpoch), nil
+}
+
 func (p *pgxDispatcher) refreshSeriesEpoch() {
 	log.Info("msg", "Refreshing series cache epoch")
-	var dbCurrentEpochRaw, dbDeleteEpochRaw int64
-	row := p.conn.QueryRow(context.Background(), getEpochSQL)
-	err := row.Scan(&dbCurrentEpochRaw, &dbDeleteEpochRaw)
-	dbCurrentEpoch, dbDeleteEpoch := model.SeriesEpoch(dbCurrentEpochRaw), model.SeriesEpoch(dbDeleteEpochRaw)
-
 	cacheCurrentEpoch := p.scache.CacheEpoch()
-
+	dbCurrentEpoch, dbDeleteEpoch, err := p.getDatabaseEpochs()
 	if err != nil {
-		log.Info("msg", "An error occurred refreshing, will reset series and inverted labels caches")
+		log.Warn("msg", "Unable to get database epoch data, will reset series and inverted labels caches", "err", err.Error())
 		// Trash the cache just in case an epoch change occurred, seems safer
-		p.scache.Reset()
+		p.scache.Reset(dbCurrentEpoch)
 		// Also trash the inverted labels cache, which can also be invalidated when the series cache is
 		p.invertedLabelsCache.Reset()
 		return
 	}
+	if cacheCurrentEpoch.After(dbCurrentEpoch) {
+		log.Warn("msg", "The connector's cache epoch is greater than the databases. This is unexpected", "connector_current_epoch", cacheCurrentEpoch, "database_current_epoch", dbCurrentEpoch)
+		return
+	}
 	if dbDeleteEpoch.AfterEq(cacheCurrentEpoch) {
-		// The current cache epoch has been overtaken by the database' delete_epoch.
-		// The only way to recover from this situation is to reset our caches and let them
-		// repopulate.
+		// The current cache epoch has been overtaken by the database'
+		// delete_epoch.
+		// The only way to recover from this situation is to reset our caches
+		// and let them repopulate.
 		log.Warn("msg", "Cache epoch was overtaken by the database's delete epoch", "cache_epoch", cacheCurrentEpoch, "delete_epoch", dbDeleteEpoch)
-		p.scache.Reset()
+		p.scache.Reset(dbCurrentEpoch)
 		p.invertedLabelsCache.Reset()
 		return
 	} else {
 		start := time.Now()
 		staleSeriesIds, err := GetStaleSeriesIDs(p.conn)
 		if err != nil {
-			log.Error("msg", "error getting series ids, resetting series cache", "err", err.Error())
-			p.scache.Reset()
-			p.invertedLabelsCache.Reset()
+			log.Warn("msg", "Error getting series ids, unable to update series cache", "err", err.Error())
 			return
 		}
 		log.Info("msg", "epoch change noticed, fetched stale series from db", "count", len(staleSeriesIds), "duration", time.Since(start))
 		start = time.Now()
-		evictCount := p.scache.EvictSeriesById(staleSeriesIds)
+		evictCount := p.scache.EvictSeriesById(staleSeriesIds, dbCurrentEpoch)
 		log.Info("msg", "removed stale series", "count", evictCount, "duration", time.Since(start)) // Before merging in master, change the level to Debug.
 		// TODO (james): possibly describe a little better why we're killing this cache.
 		// Trash the inverted labels cache for now.
 		p.invertedLabelsCache.Reset()
 	}
-	p.scache.SetCacheEpochFromRefresh(dbCurrentEpoch)
 }
 
 func GetStaleSeriesIDs(conn pgxconn.PgxConn) ([]model.SeriesID, error) {
@@ -249,6 +264,7 @@ func (p *pgxDispatcher) InsertTs(ctx context.Context, dataTS model.Data) (uint64
 		numRows      uint64
 		maxt         int64
 		rows         = dataTS.Rows
+		seriesEpoch  = dataTS.SeriesCacheEpoch
 		workFinished = new(sync.WaitGroup)
 	)
 	workFinished.Add(len(rows))
@@ -264,7 +280,7 @@ func (p *pgxDispatcher) InsertTs(ctx context.Context, dataTS model.Data) (uint64
 				maxt = ts
 			}
 		}
-		p.getMetricBatcher(metricName) <- &insertDataRequest{spanCtx: span.SpanContext(), metric: metricName, data: data, finished: workFinished, errChan: errChan}
+		p.getMetricBatcher(metricName) <- &insertDataRequest{spanCtx: span.SpanContext(), metric: metricName, seriesCacheEpoch: seriesEpoch, data: data, finished: workFinished, errChan: errChan}
 	}
 	span.SetAttributes(attribute.Int64("num_rows", int64(numRows)))
 	span.SetAttributes(attribute.Int("num_metrics", len(rows)))
@@ -354,11 +370,12 @@ func (p *pgxDispatcher) getMetricBatcher(metric string) chan<- *insertDataReques
 }
 
 type insertDataRequest struct {
-	spanCtx  trace.SpanContext
-	metric   string
-	finished *sync.WaitGroup
-	data     []model.Insertable
-	errChan  chan error
+	spanCtx          trace.SpanContext
+	metric           string
+	seriesCacheEpoch model.SeriesEpoch
+	finished         *sync.WaitGroup
+	data             []model.Insertable
+	errChan          chan error
 }
 
 func (idr *insertDataRequest) reportResult(err error) {
