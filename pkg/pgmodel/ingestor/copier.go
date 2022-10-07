@@ -365,8 +365,9 @@ func insertSeries(ctx context.Context, conn pgxconn.PgxConn, onConflict bool, re
 
 	for r := range reqs {
 		req := &reqs[r]
-		if minCacheEpoch.After(req.data.batch.SeriesCacheEpoch()) {
-			minCacheEpoch = req.data.batch.SeriesCacheEpoch()
+		epoch := req.data.batch.SeriesCacheEpoch()
+		if minCacheEpoch.After(epoch) {
+			minCacheEpoch = epoch
 		}
 		// Since seriesId order is not guaranteed we need to sort it to avoid row deadlock when duplicates are sent (eg. Prometheus retry)
 		// Samples inside series should be sorted by Prometheus

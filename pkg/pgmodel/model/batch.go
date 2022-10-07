@@ -43,7 +43,7 @@ func (t *Batch) Reset() {
 		// nil all pointers to prevent memory leaks
 		t.data[i] = nil
 	}
-	*t = Batch{data: t.data[:0], numSamples: 0, numExemplars: 0}
+	*t = Batch{data: t.data[:0], numSamples: 0, numExemplars: 0, seriesCacheEpoch: SeriesEpoch(math.MaxInt64)}
 }
 
 func (t *Batch) CountSeries() int {
