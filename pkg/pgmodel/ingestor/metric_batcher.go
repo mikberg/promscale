@@ -7,6 +7,7 @@ package ingestor
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -20,6 +21,7 @@ import (
 	"github.com/timescale/promscale/pkg/pgmodel/metrics"
 	"github.com/timescale/promscale/pkg/pgmodel/model"
 	"github.com/timescale/promscale/pkg/pgxconn"
+	"github.com/timescale/promscale/pkg/psctx"
 	"github.com/timescale/promscale/pkg/tracer"
 )
 
@@ -37,6 +39,7 @@ func containsExemplars(data []model.Insertable) bool {
 
 type readRequest struct {
 	copySender <-chan copyRequest
+	startTime  time.Time
 }
 
 func metricTableName(conn pgxconn.PgxConn, metric string) (info model.MetricInfo, possiblyNew bool, err error) {
@@ -211,13 +214,22 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 	//to the batcher to keep batching until the copier is ready to read.
 	copySender := make(chan copyRequest)
 	defer close(copySender)
-	readRequest := readRequest{copySender: copySender}
+	reservation := readRequest{copySender: copySender}
+
+	startReservation := func(req *insertDataRequest) {
+		t, err := psctx.StartTime(req.requestCtx)
+		if err != nil {
+			log.Error("msg", err)
+			t = time.Time{}
+		}
+		copierReadRequestCh <- readRequest{copySender: copySender}
+	}
 
 	pending := NewPendingBuffer()
 	pending.spanCtx, span = tracer.Default().Start(context.Background(), "send-batches")
 	span.SetAttributes(attribute.String("metric", info.TableName))
 	addReq(firstReq, pending)
-	copierReadRequestCh <- readRequest
+	startReservation(firstReq)
 	span.AddEvent("Sent a read request")
 
 	for {
@@ -228,7 +240,7 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 				return
 			}
 			addReq(req, pending)
-			copierReadRequestCh <- readRequest
+			startReservation(req)
 			span.AddEvent("Sent a read request")
 		}
 
