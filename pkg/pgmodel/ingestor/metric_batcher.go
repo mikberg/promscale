@@ -232,8 +232,8 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 	pending := NewPendingBuffer()
 	pending.spanCtx, span = tracer.Default().Start(context.Background(), "send-batches")
 	span.SetAttributes(attribute.String("metric", info.TableName))
-	addReq(firstReq, pending)
 	startReservation(firstReq)
+	addReq(firstReq, pending)
 	span.AddEvent("Sent a read request")
 
 	for {
@@ -243,8 +243,8 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 			if !ok {
 				return
 			}
-			addReq(req, pending)
 			startReservation(req)
+			addReq(req, pending)
 			span.AddEvent("Sent a read request")
 		}
 
