@@ -39,7 +39,6 @@ func containsExemplars(data []model.Insertable) bool {
 
 type readRequest struct {
 	copySender <-chan copyRequest
-	startTime  time.Time
 }
 
 func metricTableName(conn pgxconn.PgxConn, metric string) (info model.MetricInfo, possiblyNew bool, err error) {
@@ -142,7 +141,6 @@ func runMetricBatcher(conn pgxconn.PgxConn,
 	metricName string,
 	completeMetricCreationSignal chan struct{},
 	metricTableNames cache.MetricCache,
-	copierReadRequestCh chan<- readRequest,
 ) {
 	var (
 		info        model.MetricInfo
@@ -167,7 +165,7 @@ func runMetricBatcher(conn pgxconn.PgxConn,
 	if !firstReqSet {
 		return
 	}
-	sendBatches(firstReq, input, conn, &info, copierReadRequestCh)
+	sendBatches(firstReq, input, conn, &info)
 }
 
 //the basic structure of communication from the batcher to the copier is as follows:
@@ -184,12 +182,13 @@ func runMetricBatcher(conn pgxconn.PgxConn,
 //     of requests consecutively to minimize processing delays. That's what the mutex in the copier does.
 // 2. There is an auto-adjusting adaptation loop in step 3. The longer the copier takes to catch up to the readRequest in the queue, the more things will be batched
 // 3. The batcher has only a single read request out at a time.
-func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, conn pgxconn.PgxConn, info *model.MetricInfo, copierReadRequestCh chan<- readRequest) {
+func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, conn pgxconn.PgxConn, info *model.MetricInfo) {
 	var (
 		exemplarsInitialized = false
 		span                 trace.Span
 	)
 
+	var reservation Reservation
 	addReq := func(req *insertDataRequest, buf *pendingBuffer) {
 		if !exemplarsInitialized && containsExemplars(req.data) {
 			if err := initializeExemplars(conn, info.TableName); err != nil {
@@ -208,13 +207,18 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 			trace.WithAttributes(attribute.Int("insertable_count", len(req.data))),
 		)
 		buf.addReq(req)
+		t, err := psctx.StartTime(req.requestCtx)
+		if err != nil {
+			log.Error("msg", err)
+			t = time.Time{}
+		}
+		reservation.Update(globalReservationQueue, t)
 		addSpan.End()
 	}
 	//This channel in synchronous (no buffering). This provides backpressure
 	//to the batcher to keep batching until the copier is ready to read.
 	copySender := make(chan copyRequest)
 	defer close(copySender)
-	reservation := readRequest{copySender: copySender}
 
 	startReservation := func(req *insertDataRequest) {
 		t, err := psctx.StartTime(req.requestCtx)
@@ -222,7 +226,7 @@ func sendBatches(firstReq *insertDataRequest, input chan *insertDataRequest, con
 			log.Error("msg", err)
 			t = time.Time{}
 		}
-		copierReadRequestCh <- readRequest{copySender: copySender}
+		reservation = globalReservationQueue.Add(copySender, t)
 	}
 
 	pending := NewPendingBuffer()

@@ -43,7 +43,6 @@ type pgxDispatcher struct {
 	batchers               sync.Map
 	completeMetricCreation chan struct{}
 	asyncAcks              bool
-	copierReadRequestCh    chan<- readRequest
 	seriesEpochRefresh     *time.Ticker
 	doneChannel            chan struct{}
 	closed                 *uber_atomic.Bool
@@ -59,12 +58,9 @@ func newPgxDispatcher(conn pgxconn.PgxConn, mCache cache.MetricCache, scache cac
 		numCopiers = 1
 	}
 
-	// the copier read request channel retains the queue order between metrics
-	maxMetrics := 10000
-	copierReadRequestCh := make(chan readRequest, maxMetrics)
-
-	metrics.IngestorChannelCap.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "sample"}).Set(float64(cap(copierReadRequestCh)))
-	metrics.RegisterCopierChannelLenMetric(func() float64 { return float64(len(copierReadRequestCh)) })
+	//TODO remove
+	//metrics.IngestorChannelCap.With(prometheus.Labels{"type": "metric", "subsystem": "copier", "kind": "sample"}).Set(float64(cap(copierReadRequestCh)))
+	//metrics.RegisterCopierChannelLenMetric(func() float64 { return float64(len(copierReadRequestCh)) })
 
 	if cfg.IgnoreCompressedChunks {
 		// Handle decompression to not decompress anything.
@@ -84,7 +80,7 @@ func newPgxDispatcher(conn pgxconn.PgxConn, mCache cache.MetricCache, scache cac
 	elf := NewExamplarLabelFormatter(conn, eCache)
 
 	for i := 0; i < numCopiers; i++ {
-		go runCopier(conn, copierReadRequestCh, sw, elf)
+		go runCopier(conn, sw, elf)
 	}
 
 	inserter := &pgxDispatcher{
@@ -95,7 +91,6 @@ func newPgxDispatcher(conn pgxconn.PgxConn, mCache cache.MetricCache, scache cac
 		exemplarKeyPosCache:    eCache,
 		completeMetricCreation: make(chan struct{}, 1),
 		asyncAcks:              cfg.MetricsAsyncAcks,
-		copierReadRequestCh:    copierReadRequestCh,
 		// set to run at half our deletion interval
 		seriesEpochRefresh: time.NewTicker(30 * time.Minute),
 		doneChannel:        make(chan struct{}),
@@ -204,7 +199,6 @@ func (p *pgxDispatcher) Close() {
 		return true
 	})
 
-	close(p.copierReadRequestCh)
 	close(p.doneChannel)
 	p.doneWG.Wait()
 }
@@ -321,7 +315,7 @@ func (p *pgxDispatcher) getMetricBatcher(metric string) chan<- *insertDataReques
 		actual, old := p.batchers.LoadOrStore(metric, c)
 		batcher = actual
 		if !old {
-			go runMetricBatcher(p.conn, c, metric, p.completeMetricCreation, p.metricTableNames, p.copierReadRequestCh)
+			go runMetricBatcher(p.conn, c, metric, p.completeMetricCreation, p.metricTableNames)
 		}
 	}
 	ch := batcher.(chan *insertDataRequest)

@@ -73,7 +73,7 @@ func (reqs copyBatch) VisitExemplar(callBack func(info *pgmodel.MetricInfo, s *p
 
 // Handles actual insertion into the DB.
 // We have one of these per connection reserved for insertion.
-func runCopier(conn pgxconn.PgxConn, in chan readRequest, sw *seriesWriter, elf *ExemplarLabelFormatter) {
+func runCopier(conn pgxconn.PgxConn, sw *seriesWriter, elf *ExemplarLabelFormatter) {
 	requestBatch := make([]readRequest, 0, metrics.MaxInsertStmtPerTxn)
 	insertBatch := make([]copyRequest, 0, cap(requestBatch))
 	for {
@@ -89,7 +89,7 @@ func runCopier(conn pgxconn.PgxConn, in chan readRequest, sw *seriesWriter, elf 
 		// the fact that we fetch the entire batch before executing any of the
 		// reads. This guarantees that we never need to batch the same metrics
 		// together in the copier.
-		requestBatch, ok = copierGetBatch(ctx, requestBatch, in)
+		requestBatch, ok = copierGetBatch(ctx, requestBatch)
 		if !ok {
 			span.End()
 			return
@@ -156,7 +156,7 @@ func persistBatch(ctx context.Context, conn pgxconn.PgxConn, sw *seriesWriter, e
 	return nil
 }
 
-func copierGetBatch(ctx context.Context, batch []readRequest, in <-chan readRequest) ([]readRequest, bool) {
+func copierGetBatch(ctx context.Context, batch []readRequest) ([]readRequest, bool) {
 	_, span := tracer.Default().Start(ctx, "get-batch")
 	defer span.End()
 	//This mutex is not for safety, but rather for better batching.
@@ -172,26 +172,27 @@ func copierGetBatch(ctx context.Context, batch []readRequest, in <-chan readRequ
 		span.AddEvent("Unlocking")
 	}(span)
 
-	req, ok := <-in
-	if !ok {
-		return batch, false
+	//todo: need to handle shutdown.
+	startTime := globalReservationQueue.Peek()
+	since := time.Since(startTime)
+	minDuration := time.Second
+	if since < minDuration {
+		span.AddEvent("Sleep waiting to batch")
+		time.Sleep(minDuration - since)
 	}
-	span.AddEvent("Appending first batch")
-	batch = append(batch, req)
+
+	span.AddEvent("After sleep")
 
 	//we use a small timeout to prevent low-pressure systems from using up too many
 	//txns and putting pressure on system
-	timeout := time.After(20 * time.Millisecond)
-hot_gather:
+	timeoutctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
 	for len(batch) < cap(batch) {
-		select {
-		case r2 := <-in:
-			span.AddEvent("Appending batch")
-			batch = append(batch, r2)
-		case <-timeout:
-			span.AddEvent("Timeout appending batches")
-			break hot_gather
+		c := globalReservationQueue.Pop(timeoutctx)
+		if c == nil {
+			break
 		}
+		batch = append(batch, readRequest{c})
 	}
 	if len(batch) == cap(batch) {
 		span.AddEvent("Batch is full")
